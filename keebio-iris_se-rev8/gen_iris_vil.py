@@ -8,6 +8,9 @@ template:
 - Rows 0 and 5 of each .vil layer (the Iris number row) are kept from the
   template. The extra innermost thumb keys (row 4/9, col 5), which have no
   physical equivalent on the Toucan2, are set to KC_NO (unused).
+- ZMK conditional layers (e.g. NUNA+SYM -> MISC) are parsed and, by
+  default, emulated via a double-MO trick because QMK tri-layer needs
+  firmware support (see CONDITIONAL_LAYER in the config).
 - Everything else on every layer is regenerated from the ZMK keymap.
 - All other .vil sections (uid, macros, tap dance, combos, key overrides,
   settings, ...) are passed through unchanged.
@@ -52,6 +55,20 @@ LAYER_MAP = {
 # Toucan2 layers with no Iris slot. Their bindings are parsed but never
 # emitted; anything that references them is an error (see MO handling below).
 DROPPED_LAYERS = {"mouse"}  # trackpad-only layer, auto-activated by touch
+
+# ZMK conditional layers (e.g. `if-layers = <NUNA SYM>; then-layer = <MISC>`)
+# need firmware support on the Iris: QMK only behaves that way when built
+# with `TRI_LAYER_ENABLE`, and the stock Keebio Vial build does not appear
+# to include it. Strategies:
+#   "double-mo": pure-keymap emulation. On layer B, the key that activates
+#                layer A becomes MO(then-layer), and vice versa - pressing
+#                the second MO key while the first is held activates the
+#                conditional layer. Works with any firmware.
+#   "firmware":  emit nothing into the keymap; requires a firmware build
+#                with TRI_LAYER_ENABLE (lower/raise = the two MO layers,
+#                adjust = the then-layer).
+#   "ignore":    emit nothing.
+CONDITIONAL_LAYER = "double-mo"
 
 # Expected ZMK bindings per layer (3x12 main + 6 thumb keys = 42 keys).
 BINDINGS_PER_LAYER = 42
@@ -212,6 +229,27 @@ def parse_keymap(path):
     return layers, defines
 
 
+def parse_conditional_layers(src, layers, defines):
+    """Parse `conditional_layers` child nodes. Returns a list of
+    (label, [zmk if-layer idx...], zmk then-layer idx)."""
+    out = []
+    m = re.search(r"\bconditional_layers\s*\{", src)
+    if not m:
+        return out
+    end = re.search(r"^\s*/\s*\{", src[m.end():], flags=re.M)
+    region = src[m.end():m.end() + end.start()] if end else src[m.end():]
+    for label, body in re.findall(r"(\w+)\s*\{([^{}]*)\}", region):
+        if_m = re.search(r"if-layers\s*=\s*<([^<>]*)>", body)
+        then_m = re.search(r"then-layer\s*=\s*<?(\w+)", body)
+        if not if_m or not then_m:
+            continue  # properties of the outer node, or an unrelated block
+        if_layers = [resolve_zmk_layer(p, layers, defines)
+                     for p in if_m.group(1).split()]
+        then_idx = resolve_zmk_layer(then_m.group(1), layers, defines)
+        out.append((label, if_layers, then_idx))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Binding translation
 # ---------------------------------------------------------------------------
@@ -320,12 +358,64 @@ def translate_binding(binding, where, layers, define, warn):
 # Merge into the Iris .vil template
 # ---------------------------------------------------------------------------
 
+def apply_conditional_layers(conds, layers, new_layout, warn):
+    """Rewrite MO keys so holding both if-layer keys activates the
+    then-layer, emulating ZMK conditional layers without firmware support."""
+    notes = []
+    if CONDITIONAL_LAYER not in ("double-mo", "firmware", "ignore"):
+        raise TranslationError(f"invalid CONDITIONAL_LAYER {CONDITIONAL_LAYER!r}")
+    if CONDITIONAL_LAYER != "double-mo":
+        return notes
+    num = len(new_layout)
+    for label, if_layers, then_idx in conds:
+        if len(if_layers) != 2:
+            warn.add(f"conditional `{label}`: only two if-layers supported "
+                     f"(got {len(if_layers)}); skipped")
+            continue
+        names = [layers[i]["label"] for i in if_layers]
+        if any(n not in LAYER_MAP for n in names + [layers[then_idx]["label"]]):
+            warn.add(f"conditional `{label}`: references a layer without an "
+                     f"Iris mapping ({names + [layers[then_idx]['label']]}); skipped")
+            continue
+        a = LAYER_MAP[names[0]]
+        b = LAYER_MAP[names[1]]
+        then = LAYER_MAP[layers[then_idx]["label"]]
+        if not (0 <= a < num and 0 <= b < num and 0 <= then < num):
+            raise TranslationError(f"conditional `{label}`: layer index out of range")
+        pos = {}
+        for idx in (a, b):
+            code = f"MO({idx})"
+            found = [(r, c) for grid in new_layout for r in range(10)
+                     for c in range(6) if grid[r][c] == code]
+            if not found:
+                warn.add(f"conditional `{label}`: no {code} keys in the "
+                         f"generated layout to build on; skipped")
+                break
+            pos[idx] = found
+        if pos.get(a) is None or pos.get(b) is None:
+            continue
+        # On layer B, the key that would activate layer A jumps straight to
+        # the then-layer (and the other way round).
+        for target, source in ((b, a), (a, b)):
+            for r, c in pos[source]:
+                if (r, c) in IRIS_PRESERVED or (r, c) in IRIS_DUMMY:
+                    raise TranslationError(
+                        f"conditional `{label}`: MO position ({r},{c}) is a "
+                        f"template/dummy cell and cannot be rewritten")
+                before = new_layout[target][r][c]
+                new_layout[target][r][c] = f"MO({then})"
+                notes.append(
+                    f"conditional `{label}`: layer {target} key at .vil[{r}][{c}] "
+                    f"{before} -> MO({then})")
+    return notes
+
+
 def toucan_binding_index(layer_bindings, rc):
     """Map RC(row, col) -> binding index for the 42-key Toucan2 layout."""
     return TOUCAN_LAYOUT.index(rc)
 
 
-def build_iris_layers(layers, defines, template, warn):
+def build_iris_layers(layers, defines, conds, template, warn):
     num_iris_layers = len(template["layout"])
     iris_layers = []
     vial_names_used = set()
@@ -395,6 +485,8 @@ def build_iris_layers(layers, defines, template, warn):
             # No Toucan layer mapped here: keep the template as-is.
             new_layout[i] = template["layout"][i]
 
+    cond_notes = apply_conditional_layers(conds, layers, new_layout, warn)
+
     # sanity checks on dummies, template rows and forced thumb keys
     for li, grid in enumerate(new_layout):
         for (r, c) in IRIS_DUMMY:
@@ -406,7 +498,7 @@ def build_iris_layers(layers, defines, template, warn):
         for (r, c) in IRIS_THUMB_NO:
             grid[r][c] = "KC_NO"
 
-    return new_layout, vial_names_used
+    return new_layout, vial_names_used, cond_notes
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +543,9 @@ def main():
     try:
         layers, defines = parse_keymap(args.keymap)
         template = json.loads(args.template.read_text())
-        new_layout, vial_names_used = build_iris_layers(layers, defines, template, warn)
+        conds = parse_conditional_layers(args.keymap.read_text(), layers, defines)
+        new_layout, vial_names_used, cond_notes = build_iris_layers(
+            layers, defines, conds, template, warn)
     except (TranslationError, json.JSONDecodeError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         warn.dump()
@@ -475,6 +569,11 @@ def main():
     if warn.items:
         print("\nWarnings (keys without a Vial equivalent were set to KC_NO):")
         warn.dump()
+
+    if cond_notes:
+        print("\nConditional layers (ZMK tri-layer) emulated via double-MO keys:")
+        for note in cond_notes:
+            print("  " + note)
 
     for li, grid in enumerate(new_layout):
         print_keymap(f"Iris layer {li}", grid)
