@@ -1,0 +1,4 @@
+[submodule "zmk-keyboard-toucan2"]
+	path = zmk-keyboard-toucan2
+	url = git@github.com:Jakkar0/zmk-keyboard-toucan2.git
+	branch = main
